@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
- */
-
 package device
 
 import (
@@ -21,6 +16,9 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+    // Hypothetical external library for generating fake traffic
+    "github.com/your-org/fake-traffic-generator/quic" // This library would need to be created
 )
 
 /* Outbound flow
@@ -94,54 +92,41 @@ func randomInt(min, max uint64) uint64 {
 }
 
 func (peer *Peer) sendRandomPackets() {
-	var Wheader = []byte{}
+	// This function would be significantly changed or replaced
+	// to call an external "traffic generation" module.
+
 	switch peer.trick {
 	case "t1":
+		// No specific changes here, but could also be enhanced
 	case "t2":
-		clist := []byte{0xDC, 0xDE, 0xD3, 0xD9, 0xD0, 0xEC, 0xEE, 0xE3}
-		Wheader = []byte{
-			clist[randomInt(0, uint64(len(clist)-1))],
-			0x00, 0x00, 0x00, 0x01, 0x08,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x44, 0xD0,
+		peer.device.log.Verbosef("%v - Generating and sending QUIC-like noise packets", peer)
+		// This is where you would call your external QUIC traffic generator.
+		// For example:
+		numPackets := randomInt(20, 50)
+		for i := uint64(0); i < numPackets; i++ {
+			if peer.device.isClosed() || !peer.isRunning.Load() {
+				return
+			}
+			
+			// Hypothetical call to a QUIC traffic generation library
+			// This function would create a byte slice resembling a QUIC packet
+			quicPacket := quic.GenerateRandomQuicPacket(peer.endpoint.DstToBytes()) // Pass destination for potential use
+			
+			if len(quicPacket) == 0 {
+				peer.device.log.Errorf("%v - Failed to generate QUIC-like packet", peer)
+				continue
+			}
+
+			err := peer.SendBuffers([][]byte{quicPacket}, true) // `true` for special handling if needed, or pass `false`
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to send QUIC-like packet: %v", peer, err)
+				return
+			}
+
+			time.Sleep(time.Duration(randomInt(80, 150)) * time.Millisecond)
 		}
-		_, err := rand.Read(Wheader[6:14])
-		if err != nil {
-			panic(err)
-		}
-	// default:
-	// 	if len(tm)%2 != 0 {
-	// 		tm = tm + "0"
-	// 	}
-	// 	decodedBytes, err := hex.DecodeString(tm)
-	// 	if err == nil {
-	// 		Wheader = decodedBytes
-	// 	}
 	default:
 		return
-	}
-
-	numPackets := randomInt(20, 50)
-	maxpLen := uint64(len(Wheader) + 120)
-	randomPacket := make([]byte, maxpLen)
-	for i := uint64(0); i < numPackets; i++ {
-		if peer.device.isClosed() || !peer.isRunning.Load() {
-			return
-		}
-
-		packetSize := randomInt(uint64(len(Wheader)+10), maxpLen)
-		_, err := rand.Read(randomPacket[len(Wheader):packetSize])
-		if err != nil {
-			return
-		}
-		copy(randomPacket[0:], Wheader)
-
-		err = peer.SendBuffers([][]byte{randomPacket[:packetSize]}, true)
-		if err != nil {
-			return
-		}
-
-		time.Sleep(time.Duration(randomInt(80, 150)) * time.Millisecond)
 	}
 }
 
@@ -151,7 +136,9 @@ func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
 		if peer.trick != "" && peer.trick != "t0" {
 			peer.device.log.Verbosef("%v - Running tricks! (keepalive)", peer)
-			peer.sendRandomPackets()
+			// This is a good place to potentially trigger some low-rate background noise
+			// or specific "magic packets" if `t2` trick is active.
+			peer.sendRandomPackets() 
 		}
 
 		elem := peer.device.NewOutboundElement()
@@ -187,9 +174,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return nil
 	}
 
+	// This is the ideal place to send a burst of "magic packets"
+	// right before the actual WireGuard handshake.
 	if peer.trick != "" && peer.trick != "t0" {
-		peer.device.log.Verbosef("%v - Running tricks! (handshake)", peer)
-		peer.sendRandomPackets()
+		peer.device.log.Verbosef("%v - Running tricks! (handshake initiation pre-amble)", peer)
+		peer.sendRandomPackets() // This would now call the QUIC-like generator
 	}
 
 	peer.handshake.lastSentHandshake = time.Now()
@@ -522,7 +511,7 @@ func calculatePaddingSize(packetSize, mtu int) int {
  */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
-	var nonce [chacha20poly1305.NonceSize]byte
+	var nonce [chacha20poly1305.NonceSize]nonce
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
