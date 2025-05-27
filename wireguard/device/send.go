@@ -24,43 +24,6 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-type (
-	QueueOutboundElementsContainer struct {
-		sync.Mutex
-		elems []*QueueOutboundElement
-		readyCond *sync.Cond
-	}
-
-	QueueOutboundElement struct {
-		peerID NoisePublicKey
-		buffer *MessageBuffer
-		packet []byte
-	}
-)
-
-func (device *Device) GetOutboundElementsContainer() *QueueOutboundElementsContainer {
-	return device.pools.outboundElementsContainers.Get().(*QueueOutboundElementsContainer)
-}
-
-func (device *Device) PutOutboundElementsContainer(container *QueueOutboundElementsContainer) {
-	for _, elem := range container.elems {
-		device.PutOutboundElement(elem)
-	}
-	container.elems = container.elems[:0]
-	device.pools.outboundElementsContainers.Put(container)
-}
-
-func (device *Device) GetOutboundElement() *QueueOutboundElement {
-	return device.pools.outboundElements.Get().(*QueueOutboundElement)
-}
-
-func (device *Device) PutOutboundElement(elem *QueueOutboundElement) {
-	elem.buffer = nil
-	elem.packet = nil
-	elem.peerID = NoisePublicKey{}
-	device.pools.outboundElements.Put(elem)
-}
-
 func (device *Device) RoutineSequentialSender() {
 	device.log.Verbosef("Routine: sequential sender started")
 	defer device.log.Verbosef("Routine: sequential sender stopped")
@@ -95,6 +58,7 @@ func (device *Device) RoutineSequentialSender() {
 				device.PutMessageBuffer(elem.buffer)
 				device.PutOutboundElement(elem)
 			}
+			elemsContainer.Unlock()
 			device.PutOutboundElementsContainer(elemsContainer)
 			continue
 		}
@@ -298,24 +262,6 @@ func (device *Device) RoutineDecryptionWorker() {
 
 		message.peer.ReceiveQueue(message.buffer)
 	}
-}
-
-func (device *Device) GetMessageBuffer() *MessageBuffer {
-	return device.pools.messageBuffers.Get().(*MessageBuffer)
-}
-
-func (device *Device) PutMessageBuffer(msg *MessageBuffer) {
-	msg.Reset()
-	device.pools.messageBuffers.Put(msg)
-}
-
-func (device *Device) GetPayloadBuffer() *PayloadBuffer {
-	return device.pools.payloadBuffers.Get().(*PayloadBuffer)
-}
-
-func (device *Device) PutPayloadBuffer(payload *PayloadBuffer) {
-	payload.Reset()
-	device.pools.payloadBuffers.Put(payload)
 }
 
 type RoutinesPool struct {
