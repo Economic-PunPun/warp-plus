@@ -80,87 +80,73 @@ func (elem *QueueOutboundElement) clearPointers() {
 }
 
 func randomInt(min, max uint64) uint64 {
-	rangee := max - min
-	if rangee < 1 {
-		return 0
+	if max <= min { // Handle cases where max is not greater than min
+		return min
 	}
-
+	rangee := max - min
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(rangee)))
 	if err != nil {
+		// Fallback to a non-random number or panic, depending on desired robustness.
+		// For now, we'll panic as random numbers are crucial here.
 		panic(err)
 	}
-
 	return min + n.Uint64()
 }
 
-func (peer *Peer) sendRandomPackets() {
-	var Wheader = []byte{}
-	switch peer.trick {
-	case "t1":
-		// No specific header for t1, pure random data or other logic if desired
-	case "t2":
-		// This is the original "t2" header as found in the initial file
-		clist := []byte{0xDC, 0xDE, 0xD3, 0xD9, 0xD0, 0xEC, 0xEE, 0xE3}
-		Wheader = []byte{
-			clist[randomInt(0, uint64(len(clist)-1))],
-			0x00, 0x00, 0x00, 0x01, 0x08,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x44, 0xD0,
-		}
-		// Fill a portion of the header with random bytes
-		_, err := rand.Read(Wheader[6:14])
-		if err != nil {
-			panic(err)
-		}
-	// default:
-	// 	if len(tm)%2 != 0 {
-	// 		tm = tm + "0"
-	// 	}
-	// 	decodedBytes, err := hex.DecodeString(tm)
-	// 	if err == nil {
-	// 		Wheader = decodedBytes
-	// 	}
-	default:
+// sendJunkPackets sends junk packets based on Jc, Jmin, Jmax parameters
+func (peer *Peer) sendJunkPackets() {
+	if peer.Jc == 0 { // If Jc (Junk packet count) is 0, don't send junk packets
 		return
 	}
 
-	numPackets := randomInt(20, 50)
-	maxpLen := uint64(len(Wheader) + 120) // Max packet length, considering header and random payload
-	randomPacket := make([]byte, maxpLen) // Pre-allocate buffer for random packet
-
+	numPackets := randomInt(uint64(0), uint64(peer.Jc)) // Send up to Jc junk packets
 	for i := uint64(0); i < numPackets; i++ {
 		if peer.device.isClosed() || !peer.isRunning.Load() {
 			return
 		}
 
-		// Determine actual packet size for this iteration
-		packetSize := randomInt(uint64(len(Wheader)+10), maxpLen) // Ensure packet has some random payload after header
-		// Fill the payload part with random bytes
-		_, err := rand.Read(randomPacket[len(Wheader):packetSize])
-		if err != nil {
-			return // Handle error, usually means rand.Reader issues
+		// Generate random packet size between Jmin and Jmax
+		packetSize := randomInt(uint64(peer.Jmin), uint64(peer.Jmax))
+		if packetSize == 0 { // Ensure packet has at least 1 byte if Jmin/Jmax allow 0
+			packetSize = 1
 		}
-		// Copy the predefined header (if any) to the beginning of the packet
-		copy(randomPacket[0:], Wheader)
-
-		// Send the generated random packet
-		err = peer.SendBuffers([][]byte{randomPacket[:packetSize]}, true) // `true` for special handling of these "trick" packets
+		
+		junkPacket := make([]byte, packetSize)
+		_, err := rand.Read(junkPacket) // Fill with random data
 		if err != nil {
-			return // Stop if sending fails
+			peer.device.log.Errorf("%v - Failed to generate random junk: %v", peer, err)
+			return
 		}
 
-		// Introduce a delay between sending random packets
-		time.Sleep(time.Duration(randomInt(80, 150)) * time.Millisecond)
+		// Send the junk packet. The `true` parameter indicates it's a special packet.
+		err = peer.SendBuffers([][]byte{junkPacket}, true)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to send junk packet: %v", peer, err)
+			return
+		}
+
+		// Introduce a small random delay between junk packets
+		time.Sleep(time.Duration(randomInt(10, 100)) * time.Millisecond)
 	}
+}
+
+// sendRandomPackets is repurposed to call sendJunkPackets
+// and is now primarily used for initial handshake and keepalives.
+// The previous 't2' logic is absorbed into the main message creation functions
+// using H1, H2, H3, H4.
+func (peer *Peer) sendRandomPackets() {
+	// This function now primarily triggers junk packet sending based on Jc, Jmin, Jmax
+	peer.sendJunkPackets()
 }
 
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		if peer.trick != "" && peer.trick != "t0" {
-			peer.device.log.Verbosef("%v - Running tricks! (keepalive)", peer)
-			peer.sendRandomPackets()
+		// Send junk packets if trick is enabled, as part of keepalive routine
+		if peer.UseProtocolExtension { // Use the new flag for protocol extension
+			peer.device.log.Verbosef("%v - Running protocol extension (keepalive)", peer)
+			peer.sendJunkPackets()
 		}
 
 		elem := peer.device.NewOutboundElement()
@@ -196,10 +182,10 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return nil
 	}
 
-	if peer.trick != "" && peer.trick != "t0" {
-		peer.device.log.Verbosef("%v - Running tricks! (handshake)", peer)
-		// This will now call the original random packet generator based on 't2' trick
-		peer.sendRandomPackets()
+	// Send junk packets before the actual WireGuard handshake initiation
+	if peer.UseProtocolExtension { // Use the new flag for protocol extension
+		peer.device.log.Verbosef("%v - Running protocol extension (handshake initiation pre-amble)", peer)
+		peer.sendJunkPackets()
 	}
 
 	peer.handshake.lastSentHandshake = time.Now()
@@ -217,6 +203,25 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, msg)
 	packet := writer.Bytes()
+
+	// Apply S1 junk and H1 magic header to the initiation packet
+	if peer.UseProtocolExtension && peer.S1 != nil && peer.H1 != nil {
+		junkSize := randomInt(0, uint64(*peer.S1)) // Generate random junk size up to S1
+		if junkSize > 0 {
+			junk := make([]byte, junkSize)
+			_, err := rand.Read(junk)
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to generate S1 junk: %v", peer, err)
+				// Continue without junk if generation fails
+			} else {
+				packet = append(packet, junk...) // Append junk to the packet
+			}
+		}
+		if len(packet) > 0 {
+			packet[0] = byte(*peer.H1) // Apply H1 magic header
+		}
+	}
+
 	peer.cookieGenerator.AddMacs(packet)
 
 	peer.timersAnyAuthenticatedPacketTraversal()
@@ -248,6 +253,25 @@ func (peer *Peer) SendHandshakeResponse() error {
 	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, response)
 	packet := writer.Bytes()
+
+	// Apply S2 junk and H2 magic header to the response packet
+	if peer.UseProtocolExtension && peer.S2 != nil && peer.H2 != nil {
+		junkSize := randomInt(0, uint64(*peer.S2)) // Generate random junk size up to S2
+		if junkSize > 0 {
+			junk := make([]byte, junkSize)
+			_, err := rand.Read(junk)
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to generate S2 junk: %v", peer, err)
+				// Continue without junk if generation fails
+			} else {
+				packet = append(packet, junk...) // Append junk to the packet
+			}
+		}
+		if len(packet) > 0 {
+			packet[0] = byte(*peer.H2) // Apply H2 magic header
+		}
+	}
+
 	peer.cookieGenerator.AddMacs(packet)
 
 	err = peer.BeginSymmetricSession()
@@ -281,8 +305,17 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 	var buf [MessageCookieReplySize]byte
 	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, reply)
+	packet := writer.Bytes()
+
+	// Apply H3 magic header to the underload (cookie reply) packet
+	if initiatingElem.peer != nil && initiatingElem.peer.UseProtocolExtension && initiatingElem.peer.H3 != nil {
+		if len(packet) > 0 {
+			packet[0] = byte(*initiatingElem.peer.H3) // Apply H3 magic header
+		}
+	}
+
 	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{writer.Bytes()}, initiatingElem.endpoint)
+	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
 	return nil
 }
 
@@ -553,6 +586,13 @@ func (device *Device) RoutineEncryption(id int) {
 			// pad content to multiple of 16
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
+
+			// Apply H4 magic header to the transport packet
+			if elem.peer != nil && elem.peer.UseProtocolExtension && elem.peer.H4 != nil {
+				if len(elem.packet) > 0 {
+					elem.packet[0] = byte(*elem.peer.H4) // Apply H4 magic header
+				}
+			}
 
 			// encrypt content and release to consumer
 
