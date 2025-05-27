@@ -6,302 +6,670 @@
 package device
 
 import (
-	"container/list"
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"math/big"
+	"net"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bepass-org/warp-plus/wireguard/conn"
+	"github.com/bepass-org/warp-plus/wireguard/tun"
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-type Peer struct {
-	isRunning         atomic.Bool
-	keypairs          Keypairs
-	handshake         Handshake
-	device            *Device
-	stopping          sync.WaitGroup // routines pending stop
-	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
-	rxBytes           atomic.Uint64  // bytes received from peer
-	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+/* Outbound flow
+ *
+ * 1. TUN queue
+ * 2. Routing (sequential)
+ * 3. Nonce assignment (sequential)
+ * 4. Encryption (parallel)
+ * 5. Transmission (sequential)
+ *
+ * The functions in this file occur (roughly) in the order in
+ * which the packets are processed.
+ *
+ * Locking, Producers and Consumers
+ *
+ * The order of packets (per peer) must be maintained,
+ * but encryption of packets happen out-of-order:
+ *
+ * The sequential consumers will attempt to take the lock,
+ * workers release lock when they have completed work (encryption) on the packet.
+ *
+ * If the element is inserted into the "encryption queue",
+ * the content is preceded by enough "junk" to contain the transport header
+ * (to allow the construction of transport messages in-place)
+ */
 
-	endpoint struct {
-		sync.Mutex
-		val            conn.Endpoint
-		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
-		disableRoaming bool
-	}
-
-	timers struct {
-		retransmitHandshake     *Timer
-		sendKeepalive           *Timer
-		newHandshake            *Timer
-		zeroKeyMaterial         *Timer
-		persistentKeepalive     *Timer
-		handshakeAttempts       atomic.Uint32
-		needAnotherKeepalive    atomic.Bool
-		sentLastMinuteHandshake atomic.Bool
-	}
-
-	state struct {
-		sync.Mutex // protects against concurrent Start/Stop
-	}
-
-	queue struct {
-		staged   chan *QueueOutboundElementsContainer // staged packets before a handshake is available
-		outbound *autodrainingOutboundQueue           // sequential ordering of udp transmission
-		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
-	}
-
-	trick    string
-	reserved [3]byte
-
-	cookieGenerator             CookieGenerator
-	trieEntries                 list.List
-	persistentKeepaliveInterval atomic.Uint32
+type QueueOutboundElement struct {
+	buffer  *[MaxMessageSize]byte // slice holding the packet data
+	packet  []byte                // slice of "buffer" (always!)
+	nonce   uint64                // nonce for encryption
+	keypair *Keypair              // keypair for encryption
+	peer    *Peer                 // related peer
 }
 
-func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
-	if device.isClosed() {
-		return nil, errors.New("device closed")
-	}
-
-	// lock resources
-	device.staticIdentity.RLock()
-	defer device.staticIdentity.RUnlock()
-
-	device.peers.Lock()
-	defer device.peers.Unlock()
-
-	// check if over limit
-	if len(device.peers.keyMap) >= MaxPeers {
-		return nil, errors.New("too many peers")
-	}
-
-	// create peer
-	peer := new(Peer)
-	peer.cookieGenerator.Init(pk)
-	peer.device = device
-	peer.queue.outbound = newAutodrainingOutboundQueue(device)
-	peer.queue.inbound = newAutodrainingInboundQueue(device)
-	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
-
-	// map public key
-	_, ok := device.peers.keyMap[pk]
-	if ok {
-		return nil, errors.New("adding existing peer")
-	}
-
-	// pre-compute DH
-	handshake := &peer.handshake
-	handshake.mutex.Lock()
-	handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(pk)
-	handshake.remoteStatic = pk
-	handshake.mutex.Unlock()
-
-	// reset endpoint
-	peer.endpoint.Lock()
-	peer.endpoint.val = nil
-	peer.endpoint.disableRoaming = false
-	peer.endpoint.clearSrcOnTx = false
-	peer.endpoint.Unlock()
-
-	// init timers
-	peer.timersInit()
-
-	// add
-	device.peers.keyMap[pk] = peer
-
-	return peer, nil
+type QueueOutboundElementsContainer struct {
+	sync.Mutex
+	elems []*QueueOutboundElement
 }
 
-func (peer *Peer) SendBuffers(buffers [][]byte, trick bool) error {
-	peer.device.net.RLock()
-	defer peer.device.net.RUnlock()
+func (device *Device) NewOutboundElement() *QueueOutboundElement {
+	elem := device.GetOutboundElement()
+	elem.buffer = device.GetMessageBuffer()
+	elem.nonce = 0
+	// keypair and peer were cleared (if necessary) by clearPointers.
+	return elem
+}
 
-	if peer.device.isClosed() {
+// clearPointers clears elem fields that contain pointers.
+// This makes the garbage collector's life easier and
+// avoids accidentally keeping other objects around unnecessarily.
+// It also reduces the possible collateral damage from use-after-free bugs.
+func (elem *QueueOutboundElement) clearPointers() {
+	elem.buffer = nil
+	elem.packet = nil
+	elem.keypair = nil
+	elem.peer = nil
+}
+
+func randomInt(min, max uint64) uint64 {
+	if max <= min { // Handle cases where max is not greater than min
+		return min
+	}
+	rangee := max - min
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(rangee)))
+	if err != nil {
+		// Fallback to a non-random number or panic, depending on desired robustness.
+		// For now, we'll panic as random numbers are crucial here.
+		panic(err)
+	}
+	return min + n.Uint64()
+}
+
+// sendJunkPackets sends junk packets based on Jc, Jmin, Jmax parameters
+func (peer *Peer) sendJunkPackets() {
+	if peer.Jc == 0 { // If Jc (Junk packet count) is 0, don't send junk packets
+		return
+	}
+
+	numPackets := randomInt(uint64(0), uint64(peer.Jc)) // Send up to Jc junk packets
+	for i := uint64(0); i < numPackets; i++ {
+		if peer.device.isClosed() || !peer.isRunning.Load() {
+			return
+		}
+
+		// Generate random packet size between Jmin and Jmax
+		packetSize := randomInt(uint64(peer.Jmin), uint64(peer.Jmax))
+		if packetSize == 0 { // Ensure packet has at least 1 byte if Jmin/Jmax allow 0
+			packetSize = 1
+		}
+		
+		junkPacket := make([]byte, packetSize)
+		_, err := rand.Read(junkPacket) // Fill with random data
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to generate random junk: %v", peer, err)
+			return
+		}
+
+		// Send the junk packet. The `true` parameter indicates it's a special packet.
+		err = peer.SendBuffers([][]byte{junkPacket}, true)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to send junk packet: %v", peer, err)
+			return
+		}
+
+		// Introduce a small random delay between junk packets
+		time.Sleep(time.Duration(randomInt(10, 100)) * time.Millisecond)
+	}
+}
+
+// sendRandomPackets is repurposed to call sendJunkPackets
+// and is now primarily used for initial handshake and keepalives.
+// The previous 't2' logic is absorbed into the main message creation functions
+// using H1, H2, H3, H4.
+func (peer *Peer) sendRandomPackets() {
+	// This function now primarily triggers junk packet sending based on Jc, Jmin, Jmax
+	peer.sendJunkPackets()
+}
+
+/* Queues a keepalive if no packets are queued for peer
+ */
+func (peer *Peer) SendKeepalive() {
+	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
+		// Send junk packets if trick is enabled, as part of keepalive routine
+		if peer.UseProtocolExtension { // Use the new flag for protocol extension
+			peer.device.log.Verbosef("%v - Running protocol extension (keepalive)", peer)
+			peer.sendJunkPackets()
+		}
+
+		elem := peer.device.NewOutboundElement()
+		elemsContainer := peer.device.GetOutboundElementsContainer()
+		elemsContainer.elems = append(elemsContainer.elems, elem)
+		select {
+		case peer.queue.staged <- elemsContainer:
+			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+		default:
+			peer.device.PutMessageBuffer(elem.buffer)
+			peer.device.PutOutboundElement(elem)
+			peer.device.PutOutboundElementsContainer(elemsContainer)
+		}
+	}
+	peer.SendStagedPackets()
+}
+
+func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+	if !isRetry {
+		peer.timers.handshakeAttempts.Store(0)
+	}
+
+	peer.handshake.mutex.RLock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.RUnlock()
+		return nil
+	}
+	peer.handshake.mutex.RUnlock()
+
+	peer.handshake.mutex.Lock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.Unlock()
 		return nil
 	}
 
-	peer.endpoint.Lock()
-	endpoint := peer.endpoint.val
-	if endpoint == nil {
-		peer.endpoint.Unlock()
-		return errors.New("no known endpoint for peer")
+	// Send junk packets before the actual WireGuard handshake initiation
+	if peer.UseProtocolExtension { // Use the new flag for protocol extension
+		peer.device.log.Verbosef("%v - Running protocol extension (handshake initiation pre-amble)", peer)
+		peer.sendJunkPackets()
 	}
-	if peer.endpoint.clearSrcOnTx {
-		endpoint.ClearSrc()
-		peer.endpoint.clearSrcOnTx = false
-	}
-	peer.endpoint.Unlock()
 
-	if !trick {
-		for i := range buffers {
-			if len(buffers[i]) > 3 && buffers[i][0] > 0 && buffers[i][0] < 5 {
-				copy(buffers[i][1:4], peer.reserved[:])
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+
+	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
+
+	msg, err := peer.device.CreateMessageInitiation(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		return err
+	}
+
+	var buf [MessageInitiationSize]byte
+	writer := bytes.NewBuffer(buf[:0])
+	binary.Write(writer, binary.LittleEndian, msg)
+	packet := writer.Bytes()
+
+	// Apply S1 junk and H1 magic header to the initiation packet
+	if peer.UseProtocolExtension && peer.S1 != nil && peer.H1 != nil {
+		junkSize := randomInt(0, uint64(*peer.S1)) // Generate random junk size up to S1
+		if junkSize > 0 {
+			junk := make([]byte, junkSize)
+			_, err := rand.Read(junk)
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to generate S1 junk: %v", peer, err)
+				// Continue without junk if generation fails
+			} else {
+				packet = append(packet, junk...) // Append junk to the packet
 			}
 		}
+		if len(packet) > 0 {
+			packet[0] = byte(*peer.H1) // Apply H1 magic header
+		}
 	}
 
-	err := peer.device.net.bind.Send(buffers, endpoint)
-	if err == nil {
-		var totalLen uint64
-		for _, b := range buffers {
-			totalLen += uint64(len(b))
+	peer.cookieGenerator.AddMacs(packet)
+
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+
+	err = peer.SendBuffers([][]byte{packet}, false)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+	}
+	peer.timersHandshakeInitiated()
+
+	return err
+}
+
+func (peer *Peer) SendHandshakeResponse() error {
+	peer.handshake.mutex.Lock()
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+
+	peer.device.log.Verbosef("%v - Sending handshake response", peer)
+
+	response, err := peer.device.CreateMessageResponse(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+		return err
+	}
+
+	var buf [MessageResponseSize]byte
+	writer := bytes.NewBuffer(buf[:0])
+	binary.Write(writer, binary.LittleEndian, response)
+	packet := writer.Bytes()
+
+	// Apply S2 junk and H2 magic header to the response packet
+	if peer.UseProtocolExtension && peer.S2 != nil && peer.H2 != nil {
+		junkSize := randomInt(0, uint64(*peer.S2)) // Generate random junk size up to S2
+		if junkSize > 0 {
+			junk := make([]byte, junkSize)
+			_, err := rand.Read(junk)
+			if err != nil {
+				peer.device.log.Errorf("%v - Failed to generate S2 junk: %v", peer, err)
+				// Continue without junk if generation fails
+			} else {
+				packet = append(packet, junk...) // Append junk to the packet
+			}
 		}
-		peer.txBytes.Add(totalLen)
+		if len(packet) > 0 {
+			packet[0] = byte(*peer.H2) // Apply H2 magic header
+		}
+	}
+
+	peer.cookieGenerator.AddMacs(packet)
+
+	err = peer.BeginSymmetricSession()
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+		return err
+	}
+
+	peer.timersSessionDerived()
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+
+	// TODO: allocation could be avoided
+	err = peer.SendBuffers([][]byte{packet}, false)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
 	return err
 }
 
-func (peer *Peer) String() string {
-	return ""
-	// The awful goo that follows is identical to:
-	//
-	//   base64Key := base64.StdEncoding.EncodeToString(peer.handshake.remoteStatic[:])
-	//   abbreviatedKey := base64Key[0:4] + "…" + base64Key[39:43]
-	//   return fmt.Sprintf("peer(%s)", abbreviatedKey)
-	//
-	// except that it is considerably more efficient.
-	src := peer.handshake.remoteStatic
-	b64 := func(input byte) byte {
-		return input + 'A' + byte(((25-int(input))>>8)&6) - byte(((51-int(input))>>8)&75) - byte(((61-int(input))>>8)&15) + byte(((62-int(input))>>8)&3)
+func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
+	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
+
+	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
+	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
+	if err != nil {
+		device.log.Errorf("Failed to create cookie reply: %v", err)
+		return err
 	}
-	b := []byte("peer(____…____)")
-	const first = len("peer(")
-	const second = len("peer(____…")
-	b[first+0] = b64((src[0] >> 2) & 63)
-	b[first+1] = b64(((src[0] << 4) | (src[1] >> 4)) & 63)
-	b[first+2] = b64(((src[1] << 2) | (src[2] >> 6)) & 63)
-	b[first+3] = b64(src[2] & 63)
-	b[second+0] = b64(src[29] & 63)
-	b[second+1] = b64((src[30] >> 2) & 63)
-	b[second+2] = b64(((src[30] << 4) | (src[31] >> 4)) & 63)
-	b[second+3] = b64((src[31] << 2) & 63)
-	return string(b)
+
+	var buf [MessageCookieReplySize]byte
+	writer := bytes.NewBuffer(buf[:0])
+	binary.Write(writer, binary.LittleEndian, reply)
+	packet := writer.Bytes()
+
+	// Apply H3 magic header to the underload (cookie reply) packet
+	if initiatingElem.peer != nil && initiatingElem.peer.UseProtocolExtension && initiatingElem.peer.H3 != nil {
+		if len(packet) > 0 {
+			packet[0] = byte(*initiatingElem.peer.H3) // Apply H3 magic header
+		}
+	}
+
+	// TODO: allocation could be avoided
+	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
+	return nil
 }
 
-func (peer *Peer) Start() {
-	// should never start a peer on a closed device
-	if peer.device.isClosed() {
+func (peer *Peer) keepKeyFreshSending() {
+	keypair := peer.keypairs.Current()
+	if keypair == nil {
+		return
+	}
+	nonce := keypair.sendNonce.Load()
+	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
+		peer.SendHandshakeInitiation(false)
+	}
+}
+
+func (device *Device) RoutineReadFromTUN() {
+	defer func() {
+		device.log.Verbosef("Routine: TUN reader - stopped")
+		device.state.stopping.Done()
+		device.queue.encryption.wg.Done()
+	}()
+
+	device.log.Verbosef("Routine: TUN reader - started")
+
+	var (
+		batchSize   = device.BatchSize()
+		readErr     error
+		elems       = make([]*QueueOutboundElement, batchSize)
+		bufs        = make([][]byte, batchSize)
+		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
+		count       = 0
+		sizes       = make([]int, batchSize)
+		offset      = MessageTransportHeaderSize
+	)
+
+	for i := range elems {
+		elems[i] = device.NewOutboundElement()
+		bufs[i] = elems[i].buffer[:]
+	}
+
+	defer func() {
+		for _, elem := range elems {
+			if elem != nil {
+				device.PutMessageBuffer(elem.buffer)
+				device.PutOutboundElement(elem)
+			}
+		}
+	}()
+
+	for {
+		// read packets
+		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		for i := 0; i < count; i++ {
+			if sizes[i] < 1 {
+				continue
+			}
+
+			elem := elems[i]
+			elem.packet = bufs[i][offset : offset+sizes[i]]
+
+			// lookup peer
+			var peer *Peer
+			switch elem.packet[0] >> 4 {
+			case 4:
+				if len(elem.packet) < ipv4.HeaderLen {
+					continue
+				}
+				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+				peer = device.allowedips.Lookup(dst)
+
+			case 6:
+				if len(elem.packet) < ipv6.HeaderLen {
+					continue
+				}
+				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
+				peer = device.allowedips.Lookup(dst)
+
+			default:
+				device.log.Verbosef("Received packet with unknown IP version")
+			}
+
+			if peer == nil {
+				continue
+			}
+			elemsForPeer, ok := elemsByPeer[peer]
+			if !ok {
+				elemsForPeer = device.GetOutboundElementsContainer()
+				elemsByPeer[peer] = elemsForPeer
+			}
+			elemsForPeer.elems = append(elemsForPeer.elems, elem)
+			elems[i] = device.NewOutboundElement()
+			bufs[i] = elems[i].buffer[:]
+		}
+
+		for peer, elemsForPeer := range elemsByPeer {
+			if peer.isRunning.Load() {
+				peer.StagePackets(elemsForPeer)
+				peer.SendStagedPackets()
+			} else {
+				for _, elem := range elemsForPeer.elems {
+					device.PutMessageBuffer(elem.buffer)
+					device.PutOutboundElement(elem)
+				}
+				device.PutOutboundElementsContainer(elemsForPeer)
+			}
+			delete(elemsByPeer, peer)
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, tun.ErrTooManySegments) {
+				// TODO: record stat for this
+				// This will happen if MSS is surprisingly small (< 576)
+				// coincident with reasonably high throughput.
+				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
+				continue
+			}
+			if !device.isClosed() {
+				if !errors.Is(readErr, os.ErrClosed) {
+					device.log.Errorf("Failed to read packet from TUN device: %v", readErr)
+				}
+				go device.Close()
+			}
+			return
+		}
+	}
+}
+
+func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
+	for {
+		select {
+		case peer.queue.staged <- elems:
+			return
+		default:
+		}
+		select {
+		case tooOld := <-peer.queue.staged:
+			for _, elem := range tooOld.elems {
+				peer.device.PutMessageBuffer(elem.buffer)
+				peer.device.PutOutboundElement(elem)
+			}
+			peer.device.PutOutboundElementsContainer(tooOld)
+		default:
+		}
+	}
+}
+
+func (peer *Peer) SendStagedPackets() {
+top:
+	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
 		return
 	}
 
-	// prevent simultaneous start/stop operations
-	peer.state.Lock()
-	defer peer.state.Unlock()
-
-	if peer.isRunning.Load() {
+	keypair := peer.keypairs.Current()
+	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		peer.SendHandshakeInitiation(false)
 		return
 	}
 
+	for {
+		var elemsContainerOOO *QueueOutboundElementsContainer
+		select {
+		case elemsContainer := <-peer.queue.staged:
+			i := 0
+			for _, elem := range elemsContainer.elems {
+				elem.peer = peer
+				elem.nonce = keypair.sendNonce.Add(1) - 1
+				if elem.nonce >= RejectAfterMessages {
+					keypair.sendNonce.Store(RejectAfterMessages)
+					if elemsContainerOOO == nil {
+						elemsContainerOOO = peer.device.GetOutboundElementsContainer()
+					}
+					elemsContainerOOO.elems = append(elemsContainerOOO.elems, elem)
+					continue
+				} else {
+					elemsContainer.elems[i] = elem
+					i++
+				}
+
+				elem.keypair = keypair
+			}
+			elemsContainer.Lock()
+			elemsContainer.elems = elemsContainer.elems[:i]
+
+			if elemsContainerOOO != nil {
+				peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
+			}
+
+			if len(elemsContainer.elems) == 0 {
+				peer.device.PutOutboundElementsContainer(elemsContainer)
+				goto top
+			}
+
+			// add to parallel and sequential queue
+			if peer.isRunning.Load() {
+				peer.queue.outbound.c <- elemsContainer
+				peer.device.queue.encryption.c <- elemsContainer
+			} else {
+				for _, elem := range elemsContainer.elems {
+					peer.device.PutMessageBuffer(elem.buffer)
+					peer.device.PutOutboundElement(elem)
+				}
+				peer.device.PutOutboundElementsContainer(elemsContainer)
+			}
+
+			if elemsContainerOOO != nil {
+				goto top
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (peer *Peer) FlushStagedPackets() {
+	for {
+		select {
+		case elemsContainer := <-peer.queue.staged:
+			for _, elem := range elemsContainer.elems {
+				peer.device.PutMessageBuffer(elem.buffer)
+				peer.device.PutOutboundElement(elem)
+			}
+			peer.device.PutOutboundElementsContainer(elemsContainer)
+		default:
+			return
+		}
+	}
+}
+
+func calculatePaddingSize(packetSize, mtu int) int {
+	lastUnit := packetSize
+	if mtu == 0 {
+		return ((lastUnit + PaddingMultiple - 1) & ^(PaddingMultiple - 1)) - lastUnit
+	}
+	if lastUnit > mtu {
+		lastUnit %= mtu
+	}
+	paddedSize := ((lastUnit + PaddingMultiple - 1) & ^(PaddingMultiple - 1))
+	if paddedSize > mtu {
+		paddedSize = mtu
+	}
+	return paddedSize - lastUnit
+}
+
+/* Encrypts the elements in the queue
+ * and marks them for sequential consumption (by releasing the mutex)
+ *
+ * Obs. One instance per core
+ */
+func (device *Device) RoutineEncryption(id int) {
+	var paddingZeros [PaddingMultiple]byte
+	var nonce [chacha20poly1305.NonceSize]byte
+
+	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
+	device.log.Verbosef("Routine: encryption worker %d - started", id)
+
+	for elemsContainer := range device.queue.encryption.c {
+		for _, elem := range elemsContainer.elems {
+			// populate header fields
+			header := elem.buffer[:MessageTransportHeaderSize]
+
+			fieldType := header[0:4]
+			fieldReceiver := header[4:8]
+			fieldNonce := header[8:16]
+
+			binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
+			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
+			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
+
+			// pad content to multiple of 16
+			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
+			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
+
+			// Apply H4 magic header to the transport packet
+			if elem.peer != nil && elem.peer.UseProtocolExtension && elem.peer.H4 != nil {
+				if len(elem.packet) > 0 {
+					elem.packet[0] = byte(*elem.peer.H4) // Apply H4 magic header
+				}
+			}
+
+			// encrypt content and release to consumer
+
+			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
+			elem.packet = elem.keypair.send.Seal(
+				header,
+				nonce[:],
+				elem.packet,
+				nil,
+			)
+		}
+		elemsContainer.Unlock()
+	}
+}
+
+func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	device := peer.device
-	device.log.Verbosef("%v - Starting", peer)
+	defer func() {
+		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
+		peer.stopping.Done()
+	}()
+	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
-	// reset routine state
-	peer.stopping.Wait()
-	peer.stopping.Add(2)
+	bufs := make([][]byte, 0, maxBatchSize)
 
-	peer.handshake.mutex.Lock()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
-	peer.handshake.mutex.Unlock()
+	for elemsContainer := range peer.queue.outbound.c {
+		bufs = bufs[:0]
+		if elemsContainer == nil {
+			return
+		}
+		if !peer.isRunning.Load() {
+			// peer has been stopped; return re-usable elems to the shared pool.
+			// This is an optimization only. It is possible for the peer to be stopped
+			// immediately after this check, in which case, elem will get processed.
+			// The timers and SendBuffers code are resilient to a few stragglers.
+			// TODO: rework peer shutdown order to ensure
+			// that we never accidentally keep timers alive longer than necessary.
+			elemsContainer.Lock()
+			for _, elem := range elemsContainer.elems {
+				device.PutMessageBuffer(elem.buffer)
+				device.PutOutboundElement(elem)
+			}
+			continue
+		}
+		dataSent := false
+		elemsContainer.Lock()
+		for _, elem := range elemsContainer.elems {
+			if len(elem.packet) != MessageKeepaliveSize {
+				dataSent = true
+			}
+			bufs = append(bufs, elem.packet)
+		}
 
-	peer.device.queue.encryption.wg.Add(1) // keep encryption queue open for our writes
+		peer.timersAnyAuthenticatedPacketTraversal()
+		peer.timersAnyAuthenticatedPacketSent()
 
-	peer.timersStart()
+		err := peer.SendBuffers(bufs, false)
+		if dataSent {
+			peer.timersDataSent()
+		}
+		for _, elem := range elemsContainer.elems {
+			device.PutMessageBuffer(elem.buffer)
+			device.PutOutboundElement(elem)
+		}
+		device.PutOutboundElementsContainer(elemsContainer)
+		if err != nil {
+			var errGSO conn.ErrUDPGSODisabled
+			if errors.As(err, &errGSO) {
+				device.log.Verbosef(err.Error())
+				err = errGSO.RetryErr
+			}
+		}
+		if err != nil {
+			device.log.Errorf("%v - Failed to send data packets: %v", peer, err)
+			continue
+		}
 
-	device.flushInboundQueue(peer.queue.inbound)
-	device.flushOutboundQueue(peer.queue.outbound)
-
-	// Use the device batch size, not the bind batch size, as the device size is
-	// the size of the batch pools.
-	batchSize := peer.device.BatchSize()
-	go peer.RoutineSequentialSender(batchSize)
-	go peer.RoutineSequentialReceiver(batchSize)
-
-	peer.isRunning.Store(true)
-}
-
-func (peer *Peer) ZeroAndFlushAll() {
-	device := peer.device
-
-	// clear key pairs
-
-	keypairs := &peer.keypairs
-	keypairs.Lock()
-	device.DeleteKeypair(keypairs.previous)
-	device.DeleteKeypair(keypairs.current)
-	device.DeleteKeypair(keypairs.next.Load())
-	keypairs.previous = nil
-	keypairs.current = nil
-	keypairs.next.Store(nil)
-	keypairs.Unlock()
-
-	// clear handshake state
-
-	handshake := &peer.handshake
-	handshake.mutex.Lock()
-	device.indexTable.Delete(handshake.localIndex)
-	handshake.Clear()
-	handshake.mutex.Unlock()
-
-	peer.FlushStagedPackets()
-}
-
-func (peer *Peer) ExpireCurrentKeypairs() {
-	handshake := &peer.handshake
-	handshake.mutex.Lock()
-	peer.device.indexTable.Delete(handshake.localIndex)
-	handshake.Clear()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
-	handshake.mutex.Unlock()
-
-	keypairs := &peer.keypairs
-	keypairs.Lock()
-	if keypairs.current != nil {
-		keypairs.current.sendNonce.Store(RejectAfterMessages)
+		peer.keepKeyFreshSending()
 	}
-	if next := keypairs.next.Load(); next != nil {
-		next.sendNonce.Store(RejectAfterMessages)
-	}
-	keypairs.Unlock()
-}
-
-func (peer *Peer) Stop() {
-	peer.state.Lock()
-	defer peer.state.Unlock()
-
-	if !peer.isRunning.Swap(false) {
-		return
-	}
-
-	peer.device.log.Verbosef("%v - Stopping", peer)
-
-	peer.timersStop()
-	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
-	peer.queue.inbound.c <- nil
-	peer.queue.outbound.c <- nil
-	peer.stopping.Wait()
-	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
-
-	peer.ZeroAndFlushAll()
-}
-
-func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
-	peer.endpoint.Lock()
-	defer peer.endpoint.Unlock()
-	if peer.endpoint.disableRoaming {
-		return
-	}
-	peer.endpoint.clearSrcOnTx = false
-	peer.endpoint.val = endpoint
-}
-
-func (peer *Peer) markEndpointSrcForClearing() {
-	peer.endpoint.Lock()
-	defer peer.endpoint.Unlock()
-	if peer.endpoint.val == nil {
-		return
-	}
-	peer.endpoint.clearSrcOnTx = true
 }
