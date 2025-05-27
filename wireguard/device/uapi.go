@@ -55,365 +55,386 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 	buf := byteBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer byteBufferPool.Put(buf)
-	sendf := func(format string, args ...any) {
-		fmt.Fprintf(buf, format, args...)
-		buf.WriteByte('\n')
-	}
-	keyf := func(prefix string, key *[32]byte) {
-		buf.Grow(len(key)*2 + 2 + len(prefix))
-		buf.WriteString(prefix)
-		buf.WriteByte('=')
-		const hex = "0123456789abcdef"
-		for i := 0; i < len(key); i++ {
-			buf.WriteByte(hex[key[i]>>4])
-			buf.WriteByte(hex[key[i]&0xf])
-		}
-		buf.WriteByte('\n')
+
+	writeBuf := func(format string, args ...any) error {
+		buf.WriteString(fmt.Sprintf(format, args...))
+		buf.WriteString("\n")
+		return nil
 	}
 
-	func() {
-		// lock required resources
-
-		device.net.RLock()
-		defer device.net.RUnlock()
-
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
-
-		device.peers.RLock()
-		defer device.peers.RUnlock()
-
-		// serialize device related values
-
-		if !device.staticIdentity.privateKey.IsZero() {
-			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
-		}
-
-		if device.net.port != 0 {
-			sendf("listen_port=%d", device.net.port)
-		}
-
-		if device.net.fwmark != 0 {
-			sendf("fwmark=%d", device.net.fwmark)
-		}
-
-		for _, peer := range device.peers.keyMap {
-			// Serialize peer state.
-			peer.handshake.mutex.RLock()
-			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
-			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
-			peer.handshake.mutex.RUnlock()
-			sendf("protocol_version=1")
-			peer.endpoint.Lock()
-			if peer.endpoint.val != nil {
-				sendf("endpoint=%s", peer.endpoint.val.DstToString())
-			}
-			peer.endpoint.Unlock()
-
-			nano := peer.lastHandshakeNano.Load()
-			secs := nano / time.Second.Nanoseconds()
-			nano %= time.Second.Nanoseconds()
-
-			sendf("last_handshake_time_sec=%d", secs)
-			sendf("last_handshake_time_nsec=%d", nano)
-			sendf("tx_bytes=%d", peer.txBytes.Load())
-			sendf("rx_bytes=%d", peer.rxBytes.Load())
-			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
-			sendf("trick=%s", peer.trick)
-			sendf("reserved=%d,%d,%d", peer.reserved[0], peer.reserved[1], peer.reserved[2])
-
-			device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
-				sendf("allowed_ip=%s", prefix.String())
-				return true
-			})
-		}
-	}()
-
-	// send lines (does not require resource locks)
-	if _, err := w.Write(buf.Bytes()); err != nil {
-		return ipcErrorf(ipc.IpcErrorIO, "failed to write output: %w", err)
+	writeHex := func(name string, val []byte) {
+		writeBuf(name+"=%x", val)
 	}
 
-	return nil
+	writeBool := func(name string, val bool) {
+		if val {
+			writeBuf(name+"=true")
+		} else {
+			writeBuf(name+"=false")
+		}
+	}
+
+	writeNum := func(name string, val int64) {
+		writeBuf(name+"=%d", val)
+	}
+
+	writeStrings := func(name string, val []string) {
+		for _, s := range val {
+			writeBuf(name+"=%s", s)
+		}
+	}
+
+	writeBuf("last_handshake_time_nanos=%d", device.lastHandshakeNano.Load())
+	writeBuf("device_state=%s", device.state.String())
+
+	writeHex("public_key", device.staticIdentity.publicKey)
+	writeHex("listen_port", []byte(strconv.Itoa(int(device.net.bind.Port()))))
+	if device.fwmark.Load() != 0 {
+		writeNum("fwmark", int64(device.fwmark.Load()))
+	}
+
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	for _, peer := range device.peers.keyMap {
+		writeBuf("peer")
+		writeHex("public_key", peer.handshake.remoteStatic)
+		if peer.endpoint.Load() != nil {
+			writeBuf("endpoint=%s", peer.endpoint.Load().String())
+		}
+		if peer.handshake.presharedKey != nil {
+			writeHex("preshared_key", peer.handshake.presharedKey[:])
+		}
+		if peer.persistentKeepaliveInterval.Load() != 0 {
+			writeNum("persistent_keepalive_interval", int64(peer.persistentKeepaliveInterval.Load().Seconds()))
+		}
+		writeNum("rx_bytes", int64(peer.rxBytes.Load()))
+		writeNum("tx_bytes", int64(peer.txBytes.Load()))
+		if peer.handshake.lastHandshakeNano.Load() != 0 {
+			writeNum("last_handshake_time_nanos", peer.handshake.lastHandshakeNano.Load())
+		}
+		if peer.handshake.remoteIndex.Load() != 0 {
+			writeNum("protocol_version", 1) // Hardcoded for now as there's only one active protocol version
+		}
+
+		// Amnezia VPN obfuscation parameters
+		writeBool("use_protocol_extension", peer.UseProtocolExtension)
+		if peer.Jc != 0 {
+			writeNum("jc", int64(peer.Jc))
+		}
+		if peer.Jmin != 0 {
+			writeNum("jmin", int64(peer.Jmin))
+		}
+		if peer.Jmax != 0 {
+			writeNum("jmax", int64(peer.Jmax))
+		}
+		if peer.S1 != nil {
+			writeNum("s1", int64(*peer.S1))
+		}
+		if peer.S2 != nil {
+			writeNum("s2", int64(*peer.S2))
+		}
+		if peer.H1 != nil {
+			writeNum("h1", int64(*peer.H1))
+		}
+		if peer.H2 != nil {
+			writeNum("h2", int64(*peer.H2))
+		}
+		if peer.H3 != nil {
+			writeNum("h3", int64(*peer.H3))
+		}
+		if peer.H4 != nil {
+			writeNum("h4", int64(*peer.H4))
+		}
+
+		for _, allowedIP := range peer.allowedIPs.Enumerate() {
+			writeBuf("allowed_ip=%s", allowedIP.String())
+		}
+	}
+
+	_, err := w.Write(buf.Bytes())
+	return err
 }
 
 // IpcSetOperation implements the WireGuard configuration protocol "set" operation.
 // See https://www.wireguard.com/xplatform/#configuration-protocol for details.
-func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+func (device *Device) IpcSetOperation(r io.Reader) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 
-	defer func() {
-		if err != nil {
-			device.log.Errorf("%v", err)
-		}
-	}()
+	type ipcSetPeer struct {
+		*Peer
+		replaceAllowedIPs bool
+		remove            bool
+		endpoint          conn.Endpoint // Only present if `endpoint` was actually parsed, rather than nil
+	}
 
-	peer := new(ipcSetPeer)
-	deviceConfig := true
+	peersToSet := make(map[NoisePublicKey]*ipcSetPeer)
+	var currentPeer *ipcSetPeer
+	var err error
 
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" {
-			// Blank line means terminate operation.
-			peer.handlePostConfig()
-			return nil
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return ipcErrorf(ipc.IpcErrorProtocol, "failed to parse line %q", line)
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			return ipcErrorf(ipc.IpcErrorInvalid, "line contains no = sign")
 		}
 
 		if key == "public_key" {
-			if deviceConfig {
-				deviceConfig = false
-			}
-			peer.handlePostConfig()
-			// Load/create the peer we are now configuring.
-			err := device.handlePublicKeyLine(peer, value)
+			currentPeer = &ipcSetPeer{}
+			key, err := hexDecode(value)
 			if err != nil {
-				return err
+				return ipcErrorf(ipc.IpcErrorInvalid, "public_key is not valid hex: %w", err)
 			}
+			if len(key) != NoisePublicKeySize {
+				return ipcErrorf(ipc.IpcErrorInvalid, "public_key has wrong length")
+			}
+			var noisePublicKey NoisePublicKey
+			copy(noisePublicKey[:], key)
+
+			device.peers.RLock()
+			currentPeer.Peer = device.peers.keyMap[noisePublicKey]
+			device.peers.RUnlock()
+
+			if currentPeer.Peer == nil {
+				currentPeer.Peer = device.NewPeer(noisePublicKey)
+			}
+			peersToSet[noisePublicKey] = currentPeer
 			continue
 		}
 
-		var err error
-		if deviceConfig {
-			err = device.handleDeviceLine(key, value)
-		} else {
-			err = device.handlePeerLine(peer, key, value)
+		if currentPeer == nil {
+			switch key {
+			case "private_key":
+				key, err := hexDecode(value)
+				if err != nil {
+					return ipcErrorf(ipc.IpcErrorInvalid, "private_key is not valid hex: %w", err)
+				}
+				if len(key) != NoisePrivateKeySize {
+					return ipcErrorf(ipc.IpcErrorInvalid, "private_key has wrong length")
+				}
+				var noisePrivateKey NoisePrivateKey
+				copy(noisePrivateKey[:], key)
+				device.SetPrivateKey(noisePrivateKey)
+				continue
+			case "listen_port":
+				port, err := strconv.ParseUint(value, 10, 16)
+				if err != nil {
+					return ipcErrorf(ipc.IpcErrorInvalid, "listen_port is not valid integer: %w", err)
+				}
+				err = device.SetListeningPort(uint16(port))
+				if err != nil {
+					return ipcErrorf(ipc.IpcErrorInvalid, "listen_port could not be set: %w", err)
+				}
+				continue
+			case "fwmark":
+				fwmark, err := strconv.ParseUint(value, 10, 32)
+				if err != nil {
+					return ipcErrorf(ipc.IpcErrorInvalid, "fwmark is not valid integer: %w", err)
+				}
+				device.SetFwmark(uint32(fwmark))
+				continue
+			}
+			return ipcErrorf(ipc.IpcErrorInvalid, "config file must start with public_key, private_key, listen_port, or fwmark")
 		}
+
+		// handle peer lines
+		err = handlePeerLine(currentPeer, key, value)
 		if err != nil {
 			return err
 		}
 	}
-	peer.handlePostConfig()
 
-	if err := scanner.Err(); err != nil {
-		return ipcErrorf(ipc.IpcErrorIO, "failed to read input: %w", err)
+	for _, p := range peersToSet {
+		if p.remove {
+			device.RemovePeer(p.Peer)
+			continue
+		}
+
+		device.AddPeer(p.Peer) // will no-op if already added
+
+		// Endpoint only configured if `endpoint` key explicitly present
+		if p.endpoint != nil {
+			p.Peer.SetEndpoint(p.endpoint)
+		}
+
+		// replace allowed ips
+		if p.replaceAllowedIPs {
+			p.Peer.allowedIPs.Clear()
+		}
+
+		// Amnezia VPN obfuscation parameters handling
+		if p.UseProtocolExtension { // Only set if explicitly enabled
+			if p.Jc != 0 {
+				p.Peer.Jc = p.Jc
+			}
+			if p.Jmin != 0 {
+				p.Peer.Jmin = p.Jmin
+			}
+			if p.Jmax != 0 {
+				p.Peer.Jmax = p.Jmax
+			}
+			if p.S1 != nil {
+				s1Val := *p.S1
+				p.Peer.S1 = &s1Val
+			}
+			if p.S2 != nil {
+				s2Val := *p.S2
+				p.Peer.S2 = &s2Val
+			}
+			if p.H1 != nil {
+				h1Val := *p.H1
+				p.Peer.H1 = &h1Val
+			}
+			if p.H2 != nil {
+				h2Val := *p.H2
+				p.Peer.H2 = &h2Val
+			}
+			if p.H3 != nil {
+				h3Val := *p.H3
+				p.Peer.H3 = &h3Val
+			}
+			if p.H4 != nil {
+				h4Val := *p.H4
+				p.Peer.H4 = &h4Val
+			}
+		} else { // If explicitly disabled, unset all.
+			p.Peer.Jc = 0
+			p.Peer.Jmin = 0
+			p.Peer.Jmax = 0
+			p.Peer.S1 = nil
+			p.Peer.S2 = nil
+			p.Peer.H1 = nil
+			p.Peer.H2 = nil
+			p.Peer.H3 = nil
+			p.Peer.H4 = nil
+		}
 	}
+
 	return nil
 }
 
-func (device *Device) handleDeviceLine(key, value string) error {
+func handlePeerLine(peer *ipcSetPeer, key string, value string) error {
+	var err error
 	switch key {
-	case "private_key":
-		var sk NoisePrivateKey
-		err := sk.FromMaybeZeroHex(value)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set private_key: %w", err)
-		}
-		device.log.Verbosef("UAPI: Updating private key")
-		device.SetPrivateKey(sk)
-
-	case "listen_port":
-		port, err := strconv.ParseUint(value, 10, 16)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse listen_port: %w", err)
-		}
-
-		// update port and rebind
-		device.log.Verbosef("UAPI: Updating listen port")
-
-		device.net.Lock()
-		device.net.port = uint16(port)
-		device.net.Unlock()
-
-		if err := device.BindUpdate(); err != nil {
-			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_port: %w", err)
-		}
-
-	case "fwmark":
-		mark, err := strconv.ParseUint(value, 10, 32)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "invalid fwmark: %w", err)
-		}
-
-		device.log.Verbosef("UAPI: Updating fwmark")
-		if err := device.BindSetMark(uint32(mark)); err != nil {
-			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to update fwmark: %w", err)
-		}
-
-	case "replace_peers":
-		if value != "true" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set replace_peers, invalid value: %v", value)
-		}
-		device.log.Verbosef("UAPI: Removing all peers")
-		device.RemoveAllPeers()
-
-	default:
-		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
-	}
-
-	return nil
-}
-
-// An ipcSetPeer is the current state of an IPC set operation on a peer.
-type ipcSetPeer struct {
-	*Peer        // Peer is the current peer being operated on
-	dummy   bool // dummy reports whether this peer is a temporary, placeholder peer
-	created bool // new reports whether this is a newly created peer
-	pkaOn   bool // pkaOn reports whether the peer had the persistent keepalive turn on
-}
-
-func (peer *ipcSetPeer) handlePostConfig() {
-	if peer.Peer == nil || peer.dummy {
-		return
-	}
-	if peer.created {
-		peer.endpoint.disableRoaming = peer.device.net.brokenRoaming && peer.endpoint.val != nil
-	}
-	if peer.device.isUp() {
-		peer.Start()
-		peer.SendHandshakeInitiation(false)
-		peer.SendStagedPackets()
-	}
-}
-
-func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error {
-	// Load/create the peer we are configuring.
-	var publicKey NoisePublicKey
-	err := publicKey.FromHex(value)
-	if err != nil {
-		return ipcErrorf(ipc.IpcErrorInvalid, "failed to get peer by public key: %w", err)
-	}
-
-	// Ignore peer with the same public key as this device.
-	device.staticIdentity.RLock()
-	peer.dummy = device.staticIdentity.publicKey.Equals(publicKey)
-	device.staticIdentity.RUnlock()
-
-	if peer.dummy {
-		peer.Peer = &Peer{}
-	} else {
-		peer.Peer = device.LookupPeer(publicKey)
-	}
-
-	peer.created = peer.Peer == nil
-	if peer.created {
-		peer.Peer, err = device.NewPeer(publicKey)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to create new peer: %w", err)
-		}
-		device.log.Verbosef("%v - UAPI: Created", peer.Peer)
-	}
-	return nil
-}
-
-func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error {
-	switch key {
-	case "update_only":
-		// allow disabling of creation
-		if value != "true" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set update only, invalid value: %v", value)
-		}
-		if peer.created && !peer.dummy {
-			device.RemovePeer(peer.handshake.remoteStatic)
-			peer.Peer = &Peer{}
-			peer.dummy = true
-		}
-
-	case "remove":
-		// remove currently selected peer from device
-		if value != "true" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set remove, invalid value: %v", value)
-		}
-		if !peer.dummy {
-			device.log.Verbosef("%v - UAPI: Removing", peer.Peer)
-			device.RemovePeer(peer.handshake.remoteStatic)
-		}
-		peer.Peer = &Peer{}
-		peer.dummy = true
-
 	case "preshared_key":
-		device.log.Verbosef("%v - UAPI: Updating preshared key", peer.Peer)
-
-		peer.handshake.mutex.Lock()
-		err := peer.handshake.presharedKey.FromHex(value)
-		peer.handshake.mutex.Unlock()
-
+		key, err := hexDecode(value)
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
+			return ipcErrorf(ipc.IpcErrorInvalid, "preshared_key is not valid hex: %w", err)
 		}
-
+		if len(key) != NoisePresharedKeySize {
+			return ipcErrorf(ipc.IpcErrorInvalid, "preshared_key has wrong length")
+		}
+		var psKey NoisePresharedKey
+		copy(psKey[:], key)
+		peer.SetPresharedKey(&psKey)
 	case "endpoint":
-		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
-		endpoint, err := device.net.bind.ParseEndpoint(value)
+		peer.endpoint, err = conn.EndpointFromString(value)
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+			return ipcErrorf(ipc.IpcErrorInvalid, "endpoint is not valid: %w", err)
 		}
-		peer.endpoint.Lock()
-		defer peer.endpoint.Unlock()
-		peer.endpoint.val = endpoint
-
 	case "persistent_keepalive_interval":
-		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
-
-		secs, err := strconv.ParseUint(value, 10, 16)
+		seconds, err := strconv.ParseUint(value, 10, 16)
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
+			return ipcErrorf(ipc.IpcErrorInvalid, "persistent_keepalive_interval is not valid integer: %w", err)
 		}
-
-		old := peer.persistentKeepaliveInterval.Swap(uint32(secs))
-
-		// Send immediate keepalive if we're turning it on and before it wasn't on.
-		peer.pkaOn = old == 0 && secs != 0
-
-	case "replace_allowed_ips":
-		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)
-		if value != "true" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips, invalid value: %v", value)
-		}
-		if peer.dummy {
-			return nil
-		}
-		device.allowedips.RemoveByPeer(peer.Peer)
-
+		peer.SetPersistentKeepalive(time.Duration(seconds) * time.Second)
 	case "allowed_ip":
-		device.log.Verbosef("%v - UAPI: Adding allowedip", peer.Peer)
-		prefix, err := netip.ParsePrefix(value)
+		ip, err := netip.ParsePrefix(value)
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
+			return ipcErrorf(ipc.IpcErrorInvalid, "allowed_ip is not valid: %w", err)
 		}
-		if peer.dummy {
-			return nil
+		peer.allowedIPs.Add(ip)
+	case "replace_allowed_ips":
+		if value != "true" {
+			return ipcErrorf(ipc.IpcErrorInvalid, "replace_allowed_ips is not true")
 		}
-		device.allowedips.Insert(prefix, peer.Peer)
+		peer.replaceAllowedIPs = true
+	case "remove":
+		if value != "true" {
+			return ipcErrorf(ipc.IpcErrorInvalid, "remove is not true")
+		}
+		peer.remove = true
 
-	case "protocol_version":
-		if value != "1" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
+	// Amnezia VPN obfuscation parameters
+	case "use_protocol_extension":
+		if value == "true" {
+			peer.UseProtocolExtension = true
+		} else if value == "false" {
+			peer.UseProtocolExtension = false
+		} else {
+			return ipcErrorf(ipc.IpcErrorInvalid, "use_protocol_extension must be true or false")
 		}
-
-	case "trick":
-		device.log.Verbosef("%v - UAPI: Setting trick", peer.Peer)
-		peer.trick = value
-
-	case "reserved":
-		device.log.Verbosef("%v - UAPI: Setting reserved: %s", peer.Peer, value)
-		vals := strings.Split(value, ",")
-		if len(vals) != 3 {
-			return ipcErrorf(ipc.IpcErrorInvalid, "invalid reserved value: %v", value)
+	case "jc":
+		jc, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jc is not a valid integer: %w", err)
 		}
-		reserved := [3]byte{}
-		for i, val := range vals {
-			parsed, err := strconv.Atoi(val)
-			if err != nil {
-				return ipcErrorf(ipc.IpcErrorInvalid, "invalid reserved value: %v", value)
-			}
-			if parsed < 0 || parsed > 0xff {
-				return ipcErrorf(ipc.IpcErrorInvalid, "invalid reserved value: %v", value)
-			}
-			reserved[i] = uint8(parsed)
+		peer.Jc = int(jc)
+	case "jmin":
+		jmin, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jmin is not a valid integer: %w", err)
 		}
-		peer.reserved = reserved
+		peer.Jmin = int(jmin)
+	case "jmax":
+		jmax, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jmax is not a valid integer: %w", err)
+		}
+		peer.Jmax = int(jmax)
+	case "s1":
+		s1, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s1 is not a valid integer: %w", err)
+		}
+		s1Int := int(s1)
+		peer.S1 = &s1Int
+	case "s2":
+		s2, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s2 is not a valid integer: %w", err)
+		}
+		s2Int := int(s2)
+		peer.S2 = &s2Int
+	case "h1":
+		h1, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "h1 is not a valid 8-bit integer: %w", err)
+		}
+		h1Byte := byte(h1)
+		peer.H1 = &h1Byte
+	case "h2":
+		h2, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "h2 is not a valid 8-bit integer: %w", err)
+		}
+		h2Byte := byte(h2)
+		peer.H2 = &h2Byte
+	case "h3":
+		h3, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "h3 is not a valid 8-bit integer: %w", err)
+		}
+		h3Byte := byte(h3)
+		peer.H3 = &h3Byte
+	case "h4":
+		h4, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "h4 is not a valid 8-bit integer: %w", err)
+		}
+		h4Byte := byte(h4)
+		peer.H4 = &h4Byte
 
 	default:
-		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)
+		return ipcErrorf(ipc.IpcErrorInvalid, "unknown key %q", key)
 	}
-
 	return nil
+}
+
+func hexDecode(s string) ([]byte, error) {
+	return ipc.HexDecode(s)
 }
 
 func (device *Device) IpcGet() (string, error) {
@@ -460,21 +481,28 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			err = device.IpcGetOperation(buffered.Writer)
 		default:
 			device.log.Errorf("invalid UAPI operation: %v", op)
-			return
+			err = ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI operation")
 		}
 
-		// write status
-		var status *IPCError
-		if err != nil && !errors.As(err, &status) {
-			// shouldn't happen
-			status = ipcErrorf(ipc.IpcErrorUnknown, "other UAPI error: %w", err)
+		if err != nil {
+			ipcErr, ok := err.(*IPCError)
+			if ok {
+				_, err = buffered.WriteString(fmt.Sprintf("errno=%d\n", ipcErr.ErrorCode()))
+			} else {
+				_, err = buffered.WriteString("errno=1\n") // EPERM
+			}
+			if err != nil {
+				return
+			}
 		}
-		if status != nil {
-			device.log.Errorf("%v", status)
-			fmt.Fprintf(buffered, "errno=%d\n\n", status.ErrorCode())
-		} else {
-			fmt.Fprintf(buffered, "errno=0\n\n")
+
+		_, err = buffered.WriteString("\n")
+		if err != nil {
+			return
 		}
-		buffered.Flush()
+		err = buffered.Flush()
+		if err != nil {
+			return
+		}
 	}
 }
