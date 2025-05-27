@@ -17,7 +17,7 @@ import (
 	"github.com/bepass-org/warp-plus/wiresocks"
 )
 
-const singleMTU = 1330
+const singleMTU = 1280
 const doubleMTU = 1280 // minimum mtu for IPv6, may cause frag reassembly somewhere
 
 type WarpOptions struct {
